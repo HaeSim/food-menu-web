@@ -165,7 +165,7 @@ async function handleLogin(
 
       // ID/PW 입력 필드 대기 로직 강화
       await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle0' }),
+        page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 }),
         page.waitForSelector('#txtUserID', { timeout: 10000 }),
         page.waitForFunction(() => document.readyState === 'complete'),
       ]);
@@ -175,17 +175,20 @@ async function handleLogin(
 
       // 로그인 처리 및 리다이렉션 대기
       logger.info('로그인 시도');
+
+      // 로그인 버튼 클릭 및 리다이렉션 처리
       await Promise.all([
-        page.waitForNavigation({
-          waitUntil: ['networkidle0', 'domcontentloaded'],
-          timeout: 30000,
-        }),
         page.evaluate(() => {
           (window as unknown as Window).OnLogon();
         }),
+        // 여러 네비게이션 이벤트를 기다림
+        page.waitForNavigation({
+          waitUntil: ['networkidle0', 'domcontentloaded'],
+          timeout: 60000, // 타임아웃 증가
+        }),
       ]);
 
-      // 로그인 성공 확인
+      // 최종 URL 확인 및 필요시 리다이렉션
       const currentUrl = page.url();
       logger.info('현재 URL', { url: currentUrl });
 
@@ -193,41 +196,40 @@ async function handleLogin(
         logger.info('메뉴 페이지로 수동 리다이렉션');
         await page.goto(`https://${env.LOGIN_DOMAIN}/food/image`, {
           waitUntil: ['networkidle0', 'domcontentloaded'],
-          timeout: 30000,
+          timeout: 60000, // 타임아웃 증가
         });
       }
 
-      // 최종 페이지 로드 확인
-      await page.waitForFunction(
-        () => {
-          return (
-            document.readyState === 'complete' &&
-            window.location.pathname === '/food/image'
-          );
-        },
-        {
-          timeout: 20000,
-          polling: 1000,
-        }
-      );
+      // 페이지 로드 완료 확인
+      await Promise.race([
+        page.waitForFunction(
+          () => {
+            return (
+              document.readyState === 'complete' &&
+              window.location.pathname === '/food/image'
+            );
+          },
+          {
+            timeout: 30000,
+            polling: 1000,
+          }
+        ),
+        new Promise((resolve) => setTimeout(resolve, 45000)), // 최대 대기 시간
+      ]);
 
       logger.info('로그인 및 리다이렉션 완료');
-      break; // 성공시 루프 종료
+      break;
     } catch (error) {
       retryCount++;
-      const errorMessage =
-        error instanceof Error ? error.message : '알 수 없는 오류';
       logger.error(`로그인 시도 ${retryCount} 실패`, error as Error);
 
       if (retryCount >= maxRetries) {
-        throw new Error(
-          `최대 재시도 횟수(${maxRetries}) 초과: ${errorMessage}`
-        );
+        throw new Error(`최대 재시도 횟수(${maxRetries}) 초과`);
       }
 
       // 페이지 리로드 후 재시도
       await page.reload({ waitUntil: 'networkidle0' });
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 3000));
     }
   }
 }
