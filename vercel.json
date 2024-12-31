@@ -1,0 +1,14 @@
+{
+  "crons": [
+    {
+      "path": "/api/menu",
+      "schedule": "0 0 * * 1"
+    }
+  ],
+  "functions": {
+    "app/api/menu/route.ts": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  }
+}
