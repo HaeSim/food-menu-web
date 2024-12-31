@@ -5,7 +5,6 @@ import chromium from '@sparticuz/chromium-min';
 import { createClient } from '@supabase/supabase-js';
 import { env } from '@/env.mjs';
 import { Window } from '@/lib/types';
-import type { Page } from 'puppeteer-core';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -14,6 +13,14 @@ interface MenuFileInfo {
   fileGroupId: string;
   fileId: string;
   accessToken: string;
+}
+
+// metrics 타입 정의 추가
+interface ProcessMetrics {
+  browserLaunchTime: number;
+  loginTime: number;
+  imageDownloadTime: number;
+  uploadTime: number;
 }
 
 // 환경에 따른 브라우저 설정을 가져오는 함수
@@ -51,252 +58,111 @@ async function getBrowserOptions() {
         : process.platform === 'darwin'
           ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
           : '/usr/bin/google-chrome',
-    headless: false,
+    headless: true,
   };
 }
 
-// 로거 타입 정의
-interface LogData {
-  message?: string;
-  error?: Error;
-  [key: string]: unknown;
-}
-
-// 로거 함수 개선
-function createLogger(prefix: string) {
-  return {
-    info: (message: string, data?: LogData) => {
-      const timestamp = new Date().toISOString();
-      console.log(
-        `[${timestamp}] [INFO] [${prefix}] ${message}`,
-        data ? data : ''
-      );
+// 로깅 유틸리티 함수 추가
+function logWithMemory(message: string, extra: object = {}) {
+  const memory = process.memoryUsage();
+  console.log({
+    timestamp: new Date().toISOString(),
+    message,
+    memoryMB: {
+      heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
+      heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
+      rss: Math.round(memory.rss / 1024 / 1024),
     },
-    error: (message: string, error?: Error) => {
-      const timestamp = new Date().toISOString();
-      console.error(
-        `[${timestamp}] [ERROR] [${prefix}] ${message}`,
-        error ? error : ''
-      );
-    },
-    debug: (message: string, data?: LogData) => {
-      const timestamp = new Date().toISOString();
-      console.debug(
-        `[${timestamp}] [DEBUG] [${prefix}] ${message}`,
-        data ? data : ''
-      );
-    },
-  };
-}
-
-// __NEXT_DATA__ 대기 로직 개선
-async function waitForNextData(
-  page: Page,
-  logger: ReturnType<typeof createLogger>
-) {
-  logger.info('__NEXT_DATA__ 대기 시작');
-
-  try {
-    // 상태 체크 인터벌 설정
-    const checkInterval = setInterval(async () => {
-      const state = await page.evaluate(() => ({
-        hasNextData: '__NEXT_DATA__' in window,
-        hasProps:
-          '__NEXT_DATA__' in window &&
-          'props' in (window as unknown as Window).__NEXT_DATA__!,
-        url: window.location.href,
-        readyState: document.readyState,
-      }));
-      logger.debug('페이지 상태 체크', state);
-    }, 5000);
-
-    // __NEXT_DATA__ 대기
-    const result = await page.waitForFunction(
-      () => {
-        try {
-          const nextData = (window as unknown as Window).__NEXT_DATA__;
-          if (!nextData?.props?.pageProps?.foodResponse) {
-            return false;
-          }
-          return true;
-        } catch (e) {
-          console.error('__NEXT_DATA__ 체크 중 오류:', e);
-          return false;
-        }
-      },
-      {
-        timeout: 30000,
-        polling: 1000,
-      }
-    );
-
-    clearInterval(checkInterval);
-    logger.info('__NEXT_DATA__ 대기 완료');
-    return result;
-  } catch (error) {
-    logger.error('__NEXT_DATA__ 대기 실패', error as Error);
-    throw error;
-  }
-}
-
-// 로그인 후 리다이렉션 처리 개선
-async function handleLogin(
-  page: Page,
-  logger: ReturnType<typeof createLogger>
-) {
-  logger.info('로그인 프로세스 시작');
-  let retryCount = 0;
-  const maxRetries = 3;
-
-  while (retryCount < maxRetries) {
-    try {
-      // SSO 리다이렉션 체인 대기
-      await page.waitForFunction(() => document.readyState === 'complete', {
-        timeout: 15000,
-      });
-
-      // 로그인 버튼이 나타날 때까지 대기 (타임아웃 증가)
-      await page.waitForSelector('button.intranet-btn-normal', {
-        timeout: 10000,
-      });
-
-      const buttons = await page.$$('button.intranet-btn-normal');
-      await buttons[0].click();
-
-      // ID/PW 입력 필드 대기 로직 강화
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 }),
-        page.waitForSelector('#txtUserID', { timeout: 10000 }),
-        page.waitForFunction(() => document.readyState === 'complete'),
-      ]);
-
-      await page.type('#txtUserID', env.LOGIN_ID);
-      await page.type('#txtPwd', env.LOGIN_PASSWORD);
-
-      // 로그인 처리 및 리다이렉션 대기
-      logger.info('로그인 시도');
-
-      // 로그인 버튼 클릭 및 리다이렉션 처리
-      await Promise.all([
-        page.evaluate(() => {
-          (window as unknown as Window).OnLogon();
-        }),
-        // 여러 네비게이션 이벤트를 기다림
-        page.waitForNavigation({
-          waitUntil: ['networkidle0', 'domcontentloaded'],
-          timeout: 60000, // 타임아웃 증가
-        }),
-      ]);
-
-      // 최종 URL 확인 및 필요시 리다이렉션
-      const currentUrl = page.url();
-      logger.info('현재 URL', { url: currentUrl });
-
-      if (!currentUrl.includes('/food/image')) {
-        logger.info('메뉴 페이지로 수동 리다이렉션');
-        await page.goto(`https://${env.LOGIN_DOMAIN}/food/image`, {
-          waitUntil: ['networkidle0', 'domcontentloaded'],
-          timeout: 60000, // 타임아웃 증가
-        });
-      }
-
-      // 페이지 로드 완료 확인
-      await Promise.race([
-        page.waitForFunction(
-          () => {
-            return (
-              document.readyState === 'complete' &&
-              window.location.pathname === '/food/image'
-            );
-          },
-          {
-            timeout: 30000,
-            polling: 1000,
-          }
-        ),
-        new Promise((resolve) => setTimeout(resolve, 45000)), // 최대 대기 시간
-      ]);
-
-      logger.info('로그인 및 리다이렉션 완료');
-      break;
-    } catch (error) {
-      retryCount++;
-      logger.error(`로그인 시도 ${retryCount} 실패`, error as Error);
-
-      if (retryCount >= maxRetries) {
-        throw new Error(`최대 재시도 횟수(${maxRetries}) 초과`);
-      }
-
-      // 페이지 리로드 후 재시도
-      await page.reload({ waitUntil: 'networkidle0' });
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
-  }
+    ...extra,
+  });
 }
 
 export async function GET() {
-  const logger = createLogger('MENU-API');
   let browser = null;
-  let page = null;
   const startTime = new Date();
-  console.log(`[${startTime.toISOString()}] 메뉴 처리 시작`);
+  const metrics: ProcessMetrics = {
+    browserLaunchTime: 0,
+    loginTime: 0,
+    imageDownloadTime: 0,
+    uploadTime: 0,
+  };
+
+  logWithMemory('메뉴 처리 시작', { startTime });
 
   try {
     const browserOptions = await getBrowserOptions();
+    logWithMemory('브라우저 옵션 설정 완료', { browserOptions });
+
+    const browserStartTime = Date.now();
     browser = await puppeteer.launch(browserOptions);
-    console.log(`[${new Date().toISOString()}] 브라우저 실행 완료`);
+    metrics.browserLaunchTime = Date.now() - browserStartTime;
+    logWithMemory('브라우저 실행 완료', {
+      launchTime: metrics.browserLaunchTime,
+    });
 
-    page = await browser.newPage();
-
-    // 페이지 이벤트 리스너 추가
-    page.on('console', (msg) => console.log('브라우저 콘솔:', msg.text()));
-    page.on('pageerror', (err) => console.error('페이지 에러:', err.message));
-    page.on('requestfailed', (request) =>
-      console.error('요청 실패:', request.url(), request.failure()?.errorText)
-    );
-
+    const page = await browser.newPage();
     page.setDefaultNavigationTimeout(30000);
 
     // 네트워크 요청 모니터링
     page.on('request', (request) => {
-      console.log(`[${new Date().toISOString()}] 요청 시작: ${request.url()}`);
-    });
-    page.on('requestfinished', (request) => {
-      console.log(`[${new Date().toISOString()}] 요청 완료: ${request.url()}`);
+      logWithMemory('네트워크 요청', {
+        url: request.url(),
+        method: request.method(),
+        resourceType: request.resourceType(),
+      });
     });
 
-    console.log(`[${new Date().toISOString()}] 메뉴 페이지 접속 시도`);
+    page.on('response', (response) => {
+      logWithMemory('네트워크 응답', {
+        url: response.url(),
+        status: response.status(),
+        ok: response.ok(),
+      });
+    });
+
+    logWithMemory('메뉴 페이지 접속 시도', {
+      url: `https://${env.LOGIN_DOMAIN}/food/image`,
+    });
+
+    // 페이지 로드 시작 시간 기록
+    const pageLoadStart = Date.now();
     await page.goto(`https://${env.LOGIN_DOMAIN}/food/image`, {
       waitUntil: 'networkidle0',
-      timeout: 30000,
     });
-
-    // 페이지 로드 상태 확인
-    await page.waitForFunction(() => document.readyState === 'complete', {
-      timeout: 10000,
-    });
-
-    logger.info('메뉴 페이지 DOM 로드 완료');
-
-    // 추가 대기 시간
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    logger.info('페이지 상태', {
-      url: page.url(),
-      title: await page.title(),
-    });
+    logWithMemory('페이지 로드 완료', { loadTime: Date.now() - pageLoadStart });
 
     const currentUrl = page.url();
     if (currentUrl.includes('/login')) {
-      await handleLogin(page, logger);
+      const loginStartTime = Date.now();
+      logWithMemory('로그인 프로세스 시작');
+
+      await page.waitForSelector('button.intranet-btn-normal');
+      const buttons = await page.$$('button.intranet-btn-normal');
+      await buttons[0].click();
+
+      await page.waitForSelector('#txtUserID');
+      await page.type('#txtUserID', env.LOGIN_ID);
+      await page.type('#txtPwd', env.LOGIN_PASSWORD);
+
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'networkidle0' }),
+        page.evaluate(() => {
+          (window as unknown as Window).OnLogon();
+        }),
+      ]);
+
+      // 로그인 후 메뉴 페이지로 다시 이동
+      await page.goto(`https://${env.LOGIN_DOMAIN}/food/image`, {
+        waitUntil: 'networkidle0',
+      });
+
+      metrics.loginTime = Date.now() - loginStartTime;
+      logWithMemory('로그인 완료', { loginTime: metrics.loginTime });
     }
 
-    // 로그인 후 페이지 로드 대기 개선
-    await page.waitForNavigation({ waitUntil: 'networkidle0' });
-    logger.info('페이지 초기 로드 완료');
-
-    // __NEXT_DATA__ 대기
-    await waitForNextData(page, logger);
+    // 파일 정보 조회 로깅 강화
+    logWithMemory('메뉴 파일 정보 조회 시작');
+    const fileInfoStartTime = Date.now();
 
     const fileInfo: MenuFileInfo = await page.evaluate(() => {
       const nextData = (window as unknown as Window).__NEXT_DATA__;
@@ -304,14 +170,19 @@ export async function GET() {
       const accessToken = nextData.props.pageProps.profile.token.accessToken;
       return { fileGroupId, fileId, accessToken };
     });
-    console.log(`[${new Date().toISOString()}] 파일 정보 조회 완료:`, {
-      fileGroupId: fileInfo.fileGroupId,
-      fileId: fileInfo.fileId,
+    logWithMemory('파일 정보 조회 완료', {
+      fileInfo: {
+        fileGroupId: fileInfo.fileGroupId,
+        fileId: fileInfo.fileId,
+        retrievalTime: Date.now() - fileInfoStartTime,
+      },
     });
 
-    // 이미지 다운로드 로깅
-    console.log(`[${new Date().toISOString()}] 이미지 다운로드 시작`);
+    // 이미지 다운로드 로깅 강화
+    const downloadStartTime = Date.now();
     const imageUrl = `https://${env.LOGIN_DOMAIN}/proxy/files/${fileInfo.fileGroupId}/file/${fileInfo.fileId}/download`;
+    logWithMemory('이미지 다운로드 시작', { imageUrl });
+
     const imageResponse = await fetch(imageUrl, {
       headers: {
         Authorization: `Bearer ${fileInfo.accessToken}`,
@@ -324,10 +195,17 @@ export async function GET() {
     }
 
     const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-    console.log(`[${new Date().toISOString()}] 이미지 다운로드 완료`);
+    metrics.imageDownloadTime = Date.now() - downloadStartTime;
+    logWithMemory('이미지 다운로드 완료', {
+      downloadTime: metrics.imageDownloadTime,
+      imageSize: imageBuffer.length,
+    });
 
-    // Supabase 업로드 로깅
-    console.log(`[${new Date().toISOString()}] Supabase 업로드 시작`);
+    // Supabase 업로드 로깅 강화
+    const uploadStartTime = Date.now();
+    const filename = `food_menu_${new Date().toISOString().split('T')[0]}.png`;
+    logWithMemory('Supabase 업로드 시작', { filename });
+
     const supabase = createClient(
       env.SUPABASE_URL,
       env.SUPABASE_SERVICE_ROLE_KEY,
@@ -338,8 +216,6 @@ export async function GET() {
         },
       }
     );
-
-    const filename = `food_menu_${new Date().toISOString().split('T')[0]}.png`;
 
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('food-menus')
@@ -363,75 +239,86 @@ export async function GET() {
 
     if (recordError) throw recordError;
 
+    metrics.uploadTime = Date.now() - uploadStartTime;
+    logWithMemory('Supabase 업로드 완료', {
+      uploadTime: metrics.uploadTime,
+      uploadPath: uploadData.path,
+    });
+
     const endTime = new Date();
-    const processingTime = endTime.getTime() - startTime.getTime();
-    console.log(
-      `[${endTime.toISOString()}] 메뉴 처리 완료 (소요시간: ${processingTime}ms)`
-    );
+    const totalTime = endTime.getTime() - startTime.getTime();
+    logWithMemory('메뉴 처리 완료', {
+      totalTime,
+      metrics,
+      success: true,
+    });
 
     return NextResponse.json({
       success: true,
       path: uploadData.path,
-      processingTime,
+      metrics,
+      totalTime,
     });
   } catch (error) {
     const errorTime = new Date();
-    console.error(`[${errorTime.toISOString()}] 상세 에러 정보:`, {
-      message: error instanceof Error ? error.message : '알 수 없는 오류',
-      stack: error instanceof Error ? error.stack : undefined,
-      type: error?.constructor?.name,
+    logWithMemory('메뉴 처리 오류', {
+      error:
+        error instanceof Error
+          ? {
+              name: error.name,
+              message: error.message,
+              stack: error.stack,
+            }
+          : '알 수 없는 오류',
+      metrics,
+      currentStep: getCurrentProcessStep(metrics),
     });
 
-    if (page) {
+    if (browser) {
       try {
-        const screenshotPath = `/tmp/error-screenshot-${errorTime.getTime()}.png`;
-        await page.screenshot({
-          path: screenshotPath,
-          fullPage: true,
-        });
-        console.log(
-          `[${new Date().toISOString()}] 에러 스크린샷 저장됨: ${screenshotPath}`
-        );
-
-        // 페이지 상태 정보 수집 개선
-        const pageState = {
+        // ... 에러 스크린샷 및 디버그 정보 수집 로직 강화 ...
+        const page = (await browser.pages())[0];
+        const debugInfo = {
           url: page.url(),
-          content: await page.content(),
+          metrics,
           cookies: await page.cookies(),
-          metrics: await page.metrics(),
-          headers: await page.evaluate(() => {
-            return {
-              userAgent: navigator.userAgent,
-              platform: navigator.platform,
-              language: navigator.language,
-            };
-          }),
+          localStorage: await page.evaluate(() => Object.entries(localStorage)),
+          html: await page.content(),
         };
-        console.log(
-          `[${new Date().toISOString()}] 상세 페이지 상태:`,
-          pageState
-        );
-      } catch (screenshotError) {
-        console.error(
-          `[${new Date().toISOString()}] 디버그 정보 수집 실패:`,
-          screenshotError
-        );
+        logWithMemory('디버그 정보 수집 완료', { debugInfo });
+      } catch (debugError) {
+        logWithMemory('디버그 정보 수집 실패', {
+          error:
+            debugError instanceof Error
+              ? debugError.message
+              : '알 수 없는 오류',
+        });
       }
     }
 
     return NextResponse.json(
       {
         error: 'Failed to process menu',
-        errorMessage:
+        errorDetails:
           error instanceof Error ? error.message : '알 수 없는 오류',
         timestamp: errorTime.toISOString(),
+        metrics,
       },
       { status: 500 }
     );
   } finally {
     if (browser) {
       await browser.close();
-      console.log(`[${new Date().toISOString()}] 브라우저 종료됨`);
+      logWithMemory('브라우저 종료됨');
     }
   }
+}
+
+// 현재 프로세스 단계를 판단하는 헬퍼 함수
+function getCurrentProcessStep(metrics: ProcessMetrics): string {
+  if (!metrics.browserLaunchTime) return 'BROWSER_LAUNCH';
+  if (!metrics.loginTime) return 'LOGIN';
+  if (!metrics.imageDownloadTime) return 'IMAGE_DOWNLOAD';
+  if (!metrics.uploadTime) return 'UPLOAD';
+  return 'COMPLETED';
 }
